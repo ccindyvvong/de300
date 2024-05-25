@@ -1,7 +1,7 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.types import DoubleType
 from pyspark.sql.dataframe import DataFrame
-from pyspark.sql.functions import col, when, udf
+from pyspark.sql.functions import col, when
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import VectorAssembler, Imputer
 from pyspark.ml.classification import RandomForestClassifier, LogisticRegression, GBTClassifier
@@ -139,28 +139,25 @@ def get_smoking_rate2(age, sex, smoke):
     else:
         return group_rate * male_rate / female_rate
 
-def pipeline(data: DataFrame):
-    # UDFs for smoking rates
-    get_smoking_rate1_udf = udf(get_smoking_rate1, DoubleType())
-    get_smoking_rate2_udf = udf(get_smoking_rate2, DoubleType())
-    
-    # Apply UDFs to create smoke1 and smoke2 columns
-    data = data.withColumn('smoke1', get_smoking_rate1_udf(col('age'), col('sex'), col('smoke')))
-    data = data.withColumn('smoke2', get_smoking_rate2_udf(col('age'), col('sex'), col('smoke')))
+def pipeline(data: DataFrame):    
+    data = data.withColumn('smoke1', get_smoking_rate1(col('age'), col('sex'), col('smoke')))
+    data = data.withColumn('smoke2', get_smoking_rate2(col('age'), col('sex'), col('smoke')))
 
     # Clean and impute steps for specific columns
     data = data.withColumn("trestbps", when(col("trestbps") < 100, 100).otherwise(col("trestbps")))
     data = data.withColumn("oldpeak", when(col("oldpeak") < 0, 0).when(col("oldpeak") > 4, 4).otherwise(col("oldpeak")))
 
-    imputer_cols = ["painloc", "painexer", "thaldur", "thalach", "fbs", "prop", "nitr", "pro", "diuretic", "exang", "slope", "smoke1", "smoke2"]
-    imputer = Imputer(inputCols=imputer_cols, outputCols=[f"{col}_imputed" for col in imputer_cols])
-
-    for col_name in ["fbs", "prop", "nitr", "pro", "diuretic"]:
-        data = data.withColumn(col_name, when(col(col_name) > 1, 1).otherwise(col(col_name)))
+    # Impute all columns with the median
+    imputer_cols = [col for col in data.columns if col != "target"]
+    imputer = Imputer(inputCols=imputer_cols, outputCols=[f"{col}_imputed" for col in imputer_cols], strategy="median")
+    data = imputer.fit(data).transform(data)
+    data = data.drop(*imputer_cols)
+    for col_name in imputer_cols:
+        data = data.withColumnRenamed(f"{col_name}_imputed", col_name)
 
     # Assemble feature columns into a single feature vector
     assembler = VectorAssembler(
-        inputCols=[f"{col}_imputed" if col in imputer_cols else col for col in data.columns if col != "target"],
+        inputCols=[col for col in data.columns if col != "target"],
         outputCol="features"
     )
 
@@ -170,9 +167,9 @@ def pipeline(data: DataFrame):
     gbt_classifier = GBTClassifier(labelCol="target", featuresCol="features")
 
     # Create pipelines for each classifier
-    rf_pipeline = Pipeline(stages=[imputer, assembler, rf_classifier])
-    lr_pipeline = Pipeline(stages=[imputer, assembler, lr_classifier])
-    gbt_pipeline = Pipeline(stages=[imputer, assembler, gbt_classifier])
+    rf_pipeline = Pipeline(stages=[assembler, rf_classifier])
+    lr_pipeline = Pipeline(stages=[assembler, lr_classifier])
+    gbt_pipeline = Pipeline(stages=[assembler, gbt_classifier])
     
     # Set up the parameter grids
     rf_paramGrid = ParamGridBuilder() \
@@ -239,14 +236,12 @@ def pipeline(data: DataFrame):
     print(f"Gradient Boosting - Selected Maximum Iterations: {gbt_selected_max_iter}")
 
 def main():
-    # Create a Spark session
     spark = SparkSession.builder \
-        .appName("Predict Heart Disease") \
+        .appName("Heart Disease Prediction") \
         .getOrCreate()
 
-    # Read data and apply pipeline
-    data = read_data(spark)
-    pipeline(data)
+    heartdisease = read_data(spark)
+    pipeline(heartdisease)
 
     spark.stop()
 

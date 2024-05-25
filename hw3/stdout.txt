@@ -1,0 +1,9 @@
+Random Forest - Area Under ROC Curve: 0.8167
+Logistic Regression - Area Under ROC Curve: 0.8230
+Gradient Boosting - Area Under ROC Curve: 0.7988
+Random Forest - Selected Maximum Tree Depth: 6
+Random Forest - Selected Number of Trees: 100
+Logistic Regression - Selected Regularization Parameter: 0.1
+Logistic Regression - Selected Elastic Net Parameter: 0.0
+Gradient Boosting - Selected Maximum Tree Depth: 2
+Gradient Boosting - Selected Maximum Iterations: 30
