@@ -37,7 +37,8 @@ TABLE_NAMES = {
     "normalization_data": "normalization_values",
     "merged_data": "heart_disease_merged",
     "spark_fe": "max_fe_features",
-    "pandas_fe": "product_fe_features"
+    "pandas_fe": "product_fe_features",
+    "scraped_data" : "heart_disease_smoking"
 }
 
 ENCODED_SUFFIX = "_encoded"
@@ -169,7 +170,6 @@ def add_data_to_table_func(**kwargs):
 
     return {'status': 1}
 
-
 def create_spark_session():
     spark = SparkSession.builder \
         .appName("Airflow Spark Pipeline") \
@@ -196,7 +196,6 @@ def extract_tables():
 
     df = pd.DataFrame(data, columns=['Age Group'] + column_headers)
     return df
-
 
 # Function to extract CDC data from a given URL
 def extract_cdc():
@@ -229,97 +228,11 @@ def extract_cdc():
                     age_groups_rates[age_group] = float(rate) / 100
     return age_groups_rates
 
-# Function to scrape data from the web
-def scrape_data_func(**kwargs):
-    smokingrates1 = extract_tables()
-    smokingrates2 = extract_cdc()
-    
-    # Rename columns in smokingrates1
-    smokingrates1 = rename_columns(smokingrates1, suffix='_1')
-    
-    # Rename columns in smokingrates2
-    smokingrates2 = rename_columns(smokingrates2, suffix='_2')
-    
-    kwargs['ti'].xcom_push(key='smokingrates1', value=smokingrates1)
-    kwargs['ti'].xcom_push(key='smokingrates2', value=smokingrates2)
-
 def rename_columns(data, suffix):
     # Add a suffix to each column name
     renamed_columns = [col + suffix for col in data.columns]
     data.columns = renamed_columns
     return data
-
-# Function to merge scraped data with feature-engineered datasets
-@from_table_to_df([TABLE_NAMES['spark_fe'], TABLE_NAMES['pandas_fe']], TABLE_NAMES["merged_data"])
-def merge_scraped_data_func(**kwargs):
-    # Get web scraped data
-    smoking_rates1 = kwargs['ti'].xcom_pull(key='smokingrates1', task_ids='scrape_data')
-    smoking_rates2 = kwargs['ti'].xcom_pull(key='smokingrates2', task_ids='scrape_data')
-
-    CONN_URI=f"{PARAMS['db']['db_alchemy_driver']}://{PARAMS['db']['username']}:{PARAMS['db']['password']}@{PARAMS['db']['host']}:{PARAMS['db']['port']}/{PARAMS['db']['db_name']}"
-
-    def get_smoking_rate1(row, rates_df):
-        age = row['age']
-        sex = row['sex']
-        age_groups = {
-            1: '15–17(a)',
-            2: '18–24',
-            3: '25–34',
-            4: '35–44',
-            5: '45–54',
-            6: '55–64',
-            7: '65–74',
-            8: '75 years and over'
-        }
-        age_group = age_groups[min(filter(lambda x: x >= 1, age_groups.keys()), key=lambda x: abs(x - age))]
-        if pd.notnull(row['smoke']):
-            return row['smoke']
-        elif sex == 1:
-            return float(rates_df.loc[rates_df['Age Group'] == age_group, 'Males (%)'].values[0])
-        elif sex == 0:
-            return float(rates_df.loc[rates_df['Age Group'] == age_group, 'Females (%)'].values[0])
-        else:
-            return None
-
-    def get_smoking_rate2(row, rates_dict):
-        age = row['age']
-        sex = row['sex']
-        if age <= 24:
-            group = "18–24"
-        elif age <= 44:
-            group = "25–44"
-        elif age <= 64:
-            group = "45–64"
-        else:
-            group = "and"
-        if pd.notnull(row['smoke']):
-            return row['smoke']
-        elif sex == 0:
-            smoke = rates_dict.get(group)
-        else:
-            smoke = rates_dict.get(group) * rates_dict.get('male') / rates_dict.get('female')
-        return smoke
-
-    # Read tables into pandas DataFrames
-    df_max_fe = pd.read_sql_table(TABLE_NAMES['spark_fe'], con=CONN_URI)
-    df_product_fe = pd.read_sql_table(TABLE_NAMES['pandas_fe'], con=CONN_URI)
-
-    # Merge DataFrames
-    df_merged = pd.merge(df_max_fe, df_product_fe, on='common_column', how='inner')
-
-    # Apply functions to calculate smoking rates
-    df_merged['smoking_rate1'] = df_merged.apply(get_smoking_rate1, rates_df=smoking_rates1, axis=1)
-    df_merged['smoking_rate2'] = df_merged.apply(get_smoking_rate2, rates_dict=smoking_rates2, axis=1)
-
-    # Convert to Spark DataFrame
-    spark = SparkSession.builder.appName("MergeData").getOrCreate()
-    spark_df = spark.createDataFrame(df_merged)
-
-    # Write to database
-    spark_df.write.format("jdbc").option("url", CONN_URI).option("dbtable", TABLE_NAMES['merged_data']).mode("overwrite").save()
-
-    # Stop SparkSession
-    spark.stop()
 
 @from_table_to_df(TABLE_NAMES['original_data'], None)
 def clean_data_func(**kwargs):
@@ -377,7 +290,7 @@ def feature_engineering_func(**kwargs):
              }]
         }
 
-@from_table_to_df(TABLE_NAMES['pandas_fe'], None)
+#@from_table_to_df(TABLE_NAMES['pandas_fe'], None)
 def train_logistic_regression_func(**kwargs):
     """
     Train a logistic regression model on the feature-engineered data.
@@ -394,7 +307,7 @@ def train_logistic_regression_func(**kwargs):
     y = df[PARAMS['ml']['labels']]
 
     # Split the data into training and test sets
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=PARAMS['ml']['train_test_ratio'], random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, train_size=0.8, test_size=PARAMS['ml']['train_test_ratio'], random_state=42)
 
     # Train the logistic regression model
     lr_model = LogisticRegression()
@@ -412,7 +325,6 @@ def train_decision_tree_func(**kwargs):
     """
     Train a decision tree classifier on the feature-engineered data.
     """
-    import pandas as pd
     from sklearn.tree import DecisionTreeClassifier
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import accuracy_score
@@ -439,27 +351,34 @@ def train_decision_tree_func(**kwargs):
 
 #@from_table_to_df(TABLE_NAMES['original_data'], None)
 def clean_data_spark_func(**kwargs):
-    """
-    Data cleaning: drop none, remove outliers based on z-scores
-    apply label encoding on categorical variables: assumption is that every string column is categorical
-    """
     spark = create_spark_session()
-
     conn_uri = f"{PARAMS['db']['db_alchemy_driver']}://{PARAMS['db']['username']}:{PARAMS['db']['password']}@{PARAMS['db']['host']}:{PARAMS['db']['port']}/{PARAMS['db']['db_name']}"
-    data_df = spark.read.format("jdbc").option("url", conn_uri).option("dbtable", TABLE_NAMES['original_data']).load()
-    
-    # Drop rows with missing values
-    data_df = data_df.dropna()
 
-    # Remove outliers using Z-score
-    numeric_columns = [v for v in data_df.columns if data_df.schema[v].dataType in ['FloatType', 'DoubleType', 'IntegerType', 'LongType'] and v != PARAMS['ml']['labels']]
-    for column in numeric_columns:
-        mean_val = data_df.select(_mean(col(column))).collect()[0][0]
-        stddev_val = data_df.select(_stddev(col(column))).collect()[0][0]
-        data_df = data_df.filter((_abs(col(column) - mean_val) / stddev_val) < PARAMS['ml']['tolerance'])
+    data = spark.read \
+    .format("jdbc") \
+    .option("url", conn_uri) \
+    .option("dbtable", "heart_disease") \
+    .load()
+
+
+    data = data.select('age', 'sex', 'painloc', 'painexer', 'cp', 'trestbps', 'smoke', 'fbs', 'prop', 
+                                       'nitr', 'pro', 'diuretic', 'thaldur', 'thalach', 'exang', 'oldpeak', 'slope', 
+                                       'target')
+    
+    # Clean and impute steps for specific columns
+    data = data.withColumn("trestbps", when(col("trestbps") < 100, 100).otherwise(col("trestbps")))
+    data = data.withColumn("oldpeak", when(col("oldpeak") < 0, 0).when(col("oldpeak") > 4, 4).otherwise(col("oldpeak")))
+
+    # Impute all columns with the median
+    imputer_cols = [col for col in data.columns if col != "target"]
+    imputer = Imputer(inputCols=imputer_cols, outputCols=[f"{col}_imputed" for col in imputer_cols], strategy="median")
+    data = imputer.fit(data).transform(data)
+    data = data.drop(*imputer_cols)
+    for col_name in imputer_cols:
+        data = data.withColumnRenamed(f"{col_name}_imputed", col_name)
 
     # Write the cleaned data back to the database
-    data_df.write.format("jdbc").option("url", conn_uri).option("dbtable", TABLE_NAMES['clean_data_spark']).mode("overwrite").save()
+    data.write.format("jdbc").option("url", conn_uri).option("dbtable", TABLE_NAMES['clean_data_spark']).mode("overwrite").save()
     
     spark.stop()
 
@@ -486,6 +405,89 @@ def feature_engineering_spark_func(**kwargs):
     # Write the feature-engineered data back to the database
     df.write.format("jdbc").option("url", conn_uri).option("dbtable", TABLE_NAMES['spark_fe']).mode("overwrite").save()
 
+    spark.stop()
+
+@from_table_to_df(TABLE_NAMES['original_data'], None)
+def scrape_data_func(**kwargs):
+    smokingrates1 = extract_tables()
+    smokingrates2 = extract_cdc()
+    df = kwargs['dfs']
+
+    def get_smoking_rate1(row, rates_df):
+        age = row['age']
+        sex = row['sex']
+        age_groups = {
+            1: '15–17(a)',
+            2: '18–24',
+            3: '25–34',
+            4: '35–44',
+            5: '45–54',
+            6: '55–64',
+            7: '65–74',
+            8: '75 years and over'
+        }
+        age_group = age_groups[min(filter(lambda x: x >= 1, age_groups.keys()), key=lambda x: abs(x - age))]
+        if pd.notnull(row['smoke']):
+            return row['smoke']
+        elif sex == 1:
+            return float(rates_df.loc[rates_df['Age Group'] == age_group, 'Males (%)'].values[0])
+        elif sex == 0:
+            return float(rates_df.loc[rates_df['Age Group'] == age_group, 'Females (%)'].values[0])
+        else:
+            return None
+
+    def get_smoking_rate2(row, rates_dict):
+        age = row['age']
+        sex = row['sex']
+        if age <= 24:
+            group = "18–24"
+        elif age <= 44:
+            group = "25–44"
+        elif age <= 64:
+            group = "45–64"
+        else:
+            group = "and"
+        if pd.notnull(row['smoke']):
+            return row['smoke']
+        elif sex == 0:
+            smoke = rates_dict.get(group)
+        else:
+            smoke = rates_dict.get(group) * rates_dict.get('male') / rates_dict.get('female')
+        return smoke
+    
+    df['smoke1'] = df.apply(lambda x: get_smoking_rate1(x,smokingrates1), axis=1)
+    df['smoke2'] = df.apply(lambda row: get_smoking_rate2(row,smokingrates2), axis=1)
+
+    return {
+        'dfs': [
+            {'df': df[['smoke1','smoke2']], 
+             'table_name': TABLE_NAMES['scraped_data']
+             }]
+        }
+
+# Function to merge scraped data with feature-engineered datasets
+@from_table_to_df(TABLE_NAMES['scraped_data'], None)
+def merge_scraped_data_func(**kwargs):
+
+    df = kwargs['dfs']
+
+    CONN_URI=f"{PARAMS['db']['db_alchemy_driver']}://{PARAMS['db']['username']}:{PARAMS['db']['password']}@{PARAMS['db']['host']}:{PARAMS['db']['port']}/{PARAMS['db']['db_name']}"
+
+    # Read tables into pandas DataFrames
+    df_max_fe = pd.read_sql_table(TABLE_NAMES['spark_fe'], con=CONN_URI)
+    df_product_fe = pd.read_sql_table(TABLE_NAMES['pandas_fe'], con=CONN_URI)
+
+    # Merge DataFrames
+    df_merged = pd.concat([df_max_fe, df_product_fe, df], axis=1)
+    
+    # Convert to Spark DataFrame
+    spark = SparkSession.builder.appName("MergeData").getOrCreate()
+    spark_df = spark.createDataFrame(df_merged)
+
+    # Write to database
+    spark_df.write.format("jdbc").option("url", CONN_URI).option("dbtable", TABLE_NAMES['merged_data']).mode("overwrite").save()
+
+    # Stop SparkSession
     spark.stop()
 
 #@from_table_to_df(TABLE_NAMES['clean_data_spark'], None)
@@ -558,74 +560,11 @@ def train_decision_tree_spark_func(**kwargs):
     
     spark.stop()
 
-# Function to scrape data from the web
-def scrape_data_func(**kwargs):
-    smokingrates1 = extract_tables()
-    smokingrates2 = extract_cdc()
-    kwargs['ti'].xcom_push(key='smokingrates1', value=smokingrates1)
-    kwargs['ti'].xcom_push(key='smokingrates2', value=smokingrates2)
-
-# Function to merge scraped data with feature-engineered datasets
-def merge_scraped_data_func(**kwargs):
-    smokingrates1 = kwargs['ti'].xcom_pull(key='smokingrates1', task_ids='scrape_data')
-    smokingrates2 = kwargs['ti'].xcom_pull(key='smokingrates2', task_ids='scrape_data')
-
-    # Assuming df_pandas contains the feature-engineered dataset
-    df_pandas = pd.read_sql_table(TABLE_NAMES['train_data'], con=CONN_URI)
-
-    # Renaming columns from the scraped data to avoid duplicates
-    smokingrates1_renamed = smokingrates1.add_suffix('_scraped1')
-    smokingrates2_renamed = smokingrates2.add_suffix('_scraped2')
-
-    # Merging the datasets
-    merged_df = pd.merge(df_pandas, smokingrates1_renamed, on='common_column', how='left')
-    merged_df = pd.merge(merged_df, smokingrates2_renamed, on='common_column', how='left')
-
-    # Convert pandas DataFrame back to Spark DataFrame
-    spark = create_spark_session()
-    spark_df = spark.createDataFrame(merged_df)
-
-    # Write the merged data to the database
-    spark_df.write.format("jdbc").option("url", conn_uri).option("dbtable", TABLE_NAMES['merged_data']).mode("overwrite").save()
-    spark.stop()
-
-@from_table_to_df(TABLE_NAMES['pandas_fe'], None)
-def train_logistic_regression_func(**kwargs):
-    """
-    Train a logistic regression model on the feature-engineered data.
-    """
-    df = kwargs['dfs']
-    import pandas as pd
-    from sklearn.model_selection import train_test_split
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import accuracy_score
-
-    Y = df[PARAMS['ml']['labels']]
-    X = df.drop(PARAMS['ml']['labels'], axis=1)
-    
-    X_train, X_val, y_train, y_val = train_test_split(X, Y, test_size=PARAMS['ml']['train_test_ratio'], random_state=42)
-
-    # Create an instance of Logistic Regression model
-    model = LogisticRegression()
-
-    # Train the model
-    model.fit(X_train, y_train)
-
-    # Make predictions on the val set
-    y_pred = model.predict(X_val)
-
-    # Calculate the accuracy of the model
-    accuracy = accuracy_score(y_val, y_pred)
-    print("Accuracy:", accuracy)        
-
-    return accuracy
-
 @from_table_to_df([TABLE_NAMES['pandas_fe'],TABLE_NAMES['clean_data_pandas']], None)
 def train_decision_tree_func(**kwargs):
     """
     Train a decision tree classifier on the feature-engineered data.
     """
-    import pandas as pd
     from sklearn.model_selection import train_test_split
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import accuracy_score
@@ -644,7 +583,7 @@ def train_decision_tree_func(**kwargs):
     Y = df[PARAMS['ml']['labels']]
     X = df.drop(PARAMS['ml']['labels'], axis=1)
     
-    X_train, X_val, y_train, y_val = train_test_split(X, Y, test_size=PARAMS['ml']['train_test_ratio'], random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(X, Y, train_size=0.8, test_size=PARAMS['ml']['train_test_ratio'], random_state=42)
 
     # Create an instance of Logistic Regression model
     model = DecisionTreeClassifier()
@@ -783,7 +722,6 @@ train_decision_tree_scraped = PythonOperator(
     provide_context=True,
     dag=dag
 )
-
 
 train_logistic_regression_pandas = PythonOperator(
     task_id='train_logistic_regression_pandas',
